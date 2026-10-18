@@ -4,7 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>القياتي للملابس | دفتر حسابات المحل</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='50' fill='rgb(107,66,38)'/%3E%3Ctext x='50' y='69' font-family='Tahoma,Arial,sans-serif' font-size='56' font-weight='bold' fill='white' text-anchor='middle'%3Eق%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#f3e6cf">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="القياتي">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
@@ -397,6 +406,11 @@ function allBuyLines(){ return cache().buyLines; }
 function allSellLines(){ return cache().sellLines; }
 function itemsCatalog(){ return Object.entries(cache().itemMap).map(([name,remainingQty])=>({name,remainingQty})); }
 function avgBuyPrice(itemName){ const b=cache().buyByItem[itemName]; return b&&b.qty? b.cost/b.qty : 0; }
+// Remaining stock with its money value: qty left x current average purchase price. Negative
+// quantities (data problems) count as zero value so they never reduce the total.
+function stockWithValue(){
+  return itemsCatalog().map(i=>{ const avg=avgBuyPrice(i.name); return {name:i.name,remainingQty:i.remainingQty,avg,value:Math.max(i.remainingQty,0)*avg}; });
+}
 // Live per-invoice profit for display — always derived from current avgBuyPrice, never from a
 // value stored on the invoice at save time (see the comment in buildCache() above).
 function invoiceProfit(inv){ return inv.items.reduce((a,it)=>a+(it.price-avgBuyPrice(it.name))*it.qty,0); }
@@ -434,7 +448,8 @@ function totals(){
   const parties=allParties();
   const receivable=parties.filter(p=>p.balance>0).reduce((a,p)=>a+p.balance,0); // net amount owed TO the shop, per person
   const payable=parties.filter(p=>p.balance<0).reduce((a,p)=>a-p.balance,0); // net amount the shop owes, per person
-  return {totalPurchases,totalSales,salesProfit,totalExpenses,totalCollected,netCashFromCustomers,receivable,payable};
+  const stockValue=stockWithValue().reduce((a,i)=>a+i.value,0);
+  return {totalPurchases,totalSales,salesProfit,totalExpenses,totalCollected,netCashFromCustomers,receivable,payable,stockValue};
 }
 
 // ---------- draft invoice building (add several items, then save one invoice) ----------
@@ -819,6 +834,7 @@ async function backupPDF(){
     </div>
     <div style="display:flex;gap:10px;margin-bottom:22px;">
       ${pdfStat('عدد الأصناف',itemsCatalog().length)}
+      ${pdfStat('قيمة البضاعة المتبقية',t.stockValue)}
     </div>
     <div style="font-size:12px;color:${c.muted};line-height:2;">
       عدد فواتير الشراء: ${state.purchaseInvoices.length}<br>
@@ -916,6 +932,7 @@ function renderDash(){
     <div class="stat ${t.netCashFromCustomers<0?'danger':''}"><span>الصافي من التحصيل بعد المصروفات</span><b>${fmt(t.netCashFromCustomers)}</b></div>
     <div class="stat warn"><span>مستحق ليك (صافي عند العملاء)</span><b>${fmt(t.receivable)}</b></div>
     <div class="stat danger"><span>مستحق عليك (صافي للموردين)</span><b>${fmt(t.payable)}</b></div>
+    <div class="stat"><span>قيمة البضاعة المتبقية (بسعر الشراء)</span><b>${fmt(t.stockValue)}</b></div>
     <div class="stat"><span>إجمالي المرتجعات</span><b>${fmt(returnsTotal)}</b></div>
   </div>
   <div class="card"><h2>آخر الفواتير</h2>${recentList()}</div>`;
@@ -981,10 +998,12 @@ function renderSell(){
   <div class="card"><h2>فواتير البيع</h2>${sellTable()}</div>`;
 }
 function stockTable(){
-  const items=itemsCatalog();
+  const items=stockWithValue();
   if(!items.length) return '<div class="emptystate">لسه مفيش أصناف</div>';
-  return `<table><thead><tr><th>الصنف</th><th>الكمية المتبقية</th></tr></thead><tbody>
-  ${items.map(i=>`<tr><td>${i.name}</td><td>${i.remainingQty<0?`<span class="tag pos">${i.remainingQty} (تحقق من البيانات)</span>`:i.remainingQty}</td></tr>`).join('')}</tbody></table>`;
+  const total=items.reduce((a,i)=>a+i.value,0);
+  return `<div class="tablewrap"><table><thead><tr><th>الصنف</th><th>الكمية المتبقية</th><th>متوسط سعر الشراء</th><th>قيمة المتبقي</th></tr></thead><tbody>
+  ${items.map(i=>`<tr><td>${i.name}</td><td>${i.remainingQty<0?`<span class="tag pos">${i.remainingQty} (تحقق من البيانات)</span>`:i.remainingQty}</td><td>${fmt(i.avg)}</td><td>${fmt(i.value)}</td></tr>`).join('')}
+  <tr style="font-weight:800;"><td colspan="3">إجمالي قيمة البضاعة المتبقية</td><td>${fmt(total)}</td></tr></tbody></table></div>`;
 }
 function sellTable(){
   if(!state.saleInvoices.length) return '<div class="emptystate">لسه مفيش فواتير بيع</div>';
