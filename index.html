@@ -995,7 +995,48 @@ function renderSell(){
   <datalist id="cusDL">${[...new Set(state.saleInvoices.map(s=>s.customer))].map(i=>`<option value="${i}">`).join('')}</datalist>
   </div>
   <div class="card"><h2>المخزون المتبقي لكل صنف</h2>${stockTable()}</div>
+  <div class="card"><h2>مبيعات كل صنف</h2><p class="small">دوس على أي صنف تشوف كل عمليات بيعه (التاريخ والعميل والكمية والسعر).</p>${itemSalesTable()}</div>
   <div class="card"><h2>فواتير البيع</h2>${sellTable()}</div>`;
+}
+// Per-item sales report, built from the (live) sale lines and sale returns: how many pieces of
+// each item were sold, at what average price, and for how much in total. Returned pieces are
+// subtracted so the figures are net.
+function salesByItem(){
+  const m={};
+  allSellLines().forEach(l=>{
+    const x=m[l.name]||(m[l.name]={name:l.name,qty:0,total:0,profit:0,retQty:0,retTotal:0});
+    x.qty+=l.qty; x.total+=l.total; x.profit+=l.profit;
+  });
+  state.returns.filter(r=>r.type==='sale').forEach(r=>{
+    const x=m[r.item]||(m[r.item]={name:r.item,qty:0,total:0,profit:0,retQty:0,retTotal:0});
+    x.retQty+=r.qty; x.retTotal+=r.total; x.profit-=(r.price-avgBuyPrice(r.item))*r.qty;
+  });
+  return Object.values(m).map(x=>{
+    const netQty=x.qty-x.retQty, netTotal=x.total-x.retTotal;
+    return {...x,netQty,netTotal,avgPrice:netQty>0?netTotal/netQty:0};
+  }).sort((a,b)=>b.netTotal-a.netTotal);
+}
+function itemSalesTable(){
+  const rows=salesByItem();
+  if(!rows.length) return '<div class="emptystate">لسه مفيش مبيعات</div>';
+  const tq=rows.reduce((a,r)=>a+r.netQty,0), tt=rows.reduce((a,r)=>a+r.netTotal,0), tp=rows.reduce((a,r)=>a+r.profit,0);
+  return `<div class="tablewrap"><table><thead><tr><th>الصنف</th><th>الكمية المباعة</th><th>متوسط سعر البيع</th><th>إجمالي البيع</th><th>الربح</th></tr></thead><tbody>
+  ${rows.map(r=>`<tr class="clickrow" onclick="openItemSales('${esc(r.name)}')"><td>${r.name}</td><td>${r.netQty}${r.retQty?` <span class="small">(مرتجع ${r.retQty})</span>`:''}</td><td>${fmt(r.avgPrice)}</td><td>${fmt(r.netTotal)}</td><td>${fmt(r.profit)}</td></tr>`).join('')}
+  <tr style="font-weight:800;"><td>الإجمالي</td><td>${tq}</td><td></td><td>${fmt(tt)}</td><td>${fmt(tp)}</td></tr></tbody></table></div>`;
+}
+function openItemSales(name){
+  const lines=allSellLines().filter(l=>l.name===name).sort((a,b)=>b.date.localeCompare(a.date));
+  const rets=state.returns.filter(r=>r.type==='sale'&&r.item===name).sort((a,b)=>b.date.localeCompare(a.date));
+  const sum=salesByItem().find(r=>r.name===name);
+  document.getElementById('modalRoot').innerHTML=`<div class="overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal lg">
+    <h2>مبيعات صنف: ${name} <button class="btn ghost sm" onclick="closeModal()">إغلاق ✕</button></h2>
+    ${sum?`<p class="small">إجمالي المباع: <b>${sum.netQty}</b> قطعة — متوسط سعر البيع: <b>${fmt(sum.avgPrice)}</b> — إجمالي البيع: <b>${fmt(sum.netTotal)}</b></p>`:''}
+    <div class="tablewrap"><table><thead><tr><th>التاريخ</th><th>العميل</th><th>الكمية</th><th>سعر القطعة</th><th>الإجمالي</th></tr></thead><tbody>
+    ${lines.map(l=>`<tr class="clickrow" onclick="openInvoice('sell','${l.invId}')"><td>${l.date}</td><td>${l.customer}</td><td>${l.qty}</td><td>${fmt(l.price)}</td><td>${fmt(l.total)}</td></tr>`).join('')}
+    ${rets.map(r=>`<tr><td>${r.date}</td><td>${r.party} <span class="tag pos">مرتجع</span></td><td>-${r.qty}</td><td>${fmt(r.price)}</td><td>-${fmt(r.total)}</td></tr>`).join('')}
+    </tbody></table></div>
+  </div></div>`;
 }
 function stockTable(){
   const items=stockWithValue();
