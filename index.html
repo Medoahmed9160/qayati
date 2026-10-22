@@ -721,18 +721,24 @@ function deleteUser(id){
 // ---------- party statement ----------
 // A "both" party shows their purchase invoices, sale invoices, all payments and all returns
 // together in one net timeline (see the sign comment on allParties() for why).
-function openPartyStatement(name,role){
+// All movements of one customer/supplier (invoices, payments, returns) in date order — shared by
+// the on-screen statement and the PDF backup so both always show the same thing.
+function partyRows(name,role){
   const isSup=role==='supplier'||role==='both', isCus=role==='customer'||role==='both';
   const buyInvs=isSup?state.purchaseInvoices.filter(i=>i.supplier===name):[];
   const sellInvs=isCus?state.saleInvoices.filter(i=>i.customer===name):[];
   const pays=state.payments.filter(p=>p.party===name);
   const rets=state.returns.filter(r=>r.party===name&&((r.type==='purchase'&&isSup)||(r.type==='sale'&&isCus)));
-  let rows=[
+  return [
     ...buyInvs.map(i=>({date:i.date,label:'فاتورة شراء',amount:-i.total,ref:()=>openInvoice('buy',i.id)})),
     ...sellInvs.map(i=>({date:i.date,label:'فاتورة بيع',amount:i.total,ref:()=>openInvoice('sell',i.id)})),
     ...pays.map(p=>({date:p.date,label:`دفعة ${p.direction==='out'?'صادرة':'واردة'}${p.note?' — '+p.note:''}`,amount:p.direction==='out'?p.amount:-p.amount})),
     ...rets.map(r=>({date:r.date,label:`مرتجع ${r.type==='sale'?'بيع':'شراء'} (${r.item} × ${r.qty})`,amount:r.type==='sale'?-r.total:r.total}))
   ].sort((a,b)=>a.date.localeCompare(b.date));
+}
+function openPartyStatement(name,role){
+  const isSup=role==='supplier'||role==='both', isCus=role==='customer'||role==='both';
+  let rows=partyRows(name,role);
   const totalBalance=rows.reduce((a,r)=>a+r.amount,0);
   const roleLabel=role==='both'?'عميل ومورد':(role==='supplier'?'مورد':'عميل');
   document.getElementById('modalRoot').innerHTML=`<div class="overlay" onclick="if(event.target===this)closeModal()">
@@ -854,6 +860,20 @@ async function backupPDF(){
       bodies.push(`${pdfSectionTitle(`${title} (${i+1}–${Math.min(i+ROWS_PER_PAGE,rows.length)} من ${rows.length})`)}${pdfTable(headers,slice.map(mapFn))}`);
     }
   }
+  const roleName=r=>r==='both'?'عميل ومورد':(r==='supplier'?'مورد':'عميل');
+  const parties=allParties();
+  chunkRows('العملاء والموردين (الأرصدة)', parties,
+    ['الاسم','النوع','الرصيد','الحالة'],
+    p=>[p.name,roleName(p.role),fmt(Math.abs(p.balance)),p.balance>0?'ليك عليه':(p.balance<0?'عليك له':'متزن')]);
+  const stock=stockWithValue();
+  const stockTotal=stock.reduce((a,i)=>a+i.value,0);
+  chunkRows('البضاعة المتبقية', stock.concat([{name:'الإجمالي',remainingQty:'',avg:null,value:stockTotal}]),
+    ['الصنف','الكمية المتبقية','متوسط سعر الشراء','قيمة المتبقي'],
+    i=>[i.name,i.remainingQty,i.avg==null?'':fmt(i.avg),fmt(i.value)]);
+  const sold=salesByItem();
+  chunkRows('الكميات المباعة لكل صنف', sold,
+    ['الصنف','الكمية المباعة','المرتجع','متوسط سعر البيع','إجمالي البيع','الربح'],
+    r=>[r.name,r.netQty,r.retQty||0,fmt(r.avgPrice),fmt(r.netTotal),fmt(r.profit)]);
   chunkRows('المشتريات', allBuyLines().slice().reverse(),
     ['التاريخ','الصنف','الكمية','سعر الشراء','الإجمالي','المورد'],
     p=>[p.date,p.name,p.qty,fmt(p.price),fmt(p.total),p.supplier]);
@@ -869,6 +889,10 @@ async function backupPDF(){
   chunkRows('المصروفات', state.expenses.slice().reverse(),
     ['التاريخ','البند','القيمة','ملاحظة'],
     x=>[x.date,x.category,fmt(x.amount),x.note||'']);
+  const stmtRows=[];
+  parties.forEach(p=>{ let run=0; partyRows(p.name,p.role).forEach(r=>{ run+=r.amount; stmtRows.push([p.name,r.date,r.label,fmt(r.amount),fmt(run)]); }); });
+  chunkRows('كشوف حساب العملاء والموردين', stmtRows,
+    ['الطرف','التاريخ','الحركة','القيمة','الرصيد بعدها'], r=>r);
   if(document.fonts&&document.fonts.ready){ try{ await document.fonts.ready; }catch(e){} }
   try{
     const doc=new jsPDF({orientation:'p',unit:'pt',format:'a4',compress:true});
