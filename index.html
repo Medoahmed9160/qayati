@@ -183,7 +183,7 @@ applyTheme(localStorage.getItem('theme_pref')||'system');
   document.documentElement.style.setProperty('--bg-watermark', uri);
 })();
 
-let state={users:[],purchaseInvoices:[],saleInvoices:[],payments:[],returns:[],expenses:[]};
+let state={users:[],purchaseInvoices:[],saleInvoices:[],payments:[],returns:[],expenses:[],meta:{}};
 let tab='dash';
 let me=null; // logged in user {id,name,role}
 let draftBuy=[]; let draftSell=[]; // pending line items while building an invoice
@@ -224,7 +224,7 @@ async function cloudFetchState(){
 async function cloudPushState(){
   const sb=getSbClient(); if(!sb) return;
   const {error}=await sb.from('shop_state').upsert({id:FIXED_ACCT,data:state,updated_at:new Date().toISOString()});
-  if(error) console.error('cloud push error',error);
+  if(error){ console.error('cloud push error',error); throw error; }
 }
 let _pushTimer=null;
 function pushCloudDebounced(){
@@ -242,7 +242,8 @@ function normalizeState(s){
     saleInvoices:Array.isArray(s.saleInvoices)?s.saleInvoices:[],
     payments:Array.isArray(s.payments)?s.payments:[],
     returns:Array.isArray(s.returns)?s.returns:[],
-    expenses:Array.isArray(s.expenses)?s.expenses:[]
+    expenses:Array.isArray(s.expenses)?s.expenses:[],
+    meta:(s.meta&&typeof s.meta==='object')?s.meta:{}
   };
 }
 async function initStorage(){
@@ -745,7 +746,10 @@ function openPartyStatement(name,role){
   <div class="modal lg">
     <h2>كشف حساب (${roleLabel}): ${name} <button class="btn ghost sm" onclick="closeModal()">إغلاق ✕</button></h2>
     <p class="small">الرصيد الحالي: <b>${fmt(Math.abs(totalBalance))}</b> ${totalBalance>0?'(ليك عليه)':(totalBalance<0?'(عليك له)':'(متزن)')}</p>
-    ${isAdmin()?`<div style="margin-bottom:10px;"><button class="btn ghost sm" onclick="addPayment('${esc(name)}','${role}')">تسجيل دفعة جديدة</button></div>`:''}
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+      ${isAdmin()?`<button class="btn ghost sm" onclick="addPayment('${esc(name)}','${role}')">تسجيل دفعة جديدة</button>`:''}
+      <button class="btn ghost sm" id="stmtPdfBtn" onclick="exportPartyPDF('${esc(name)}','${role}')">🖨️ طباعة / تنزيل PDF</button>
+    </div>
     ${!rows.length?'<div class="emptystate">لسه مفيش حركات</div>':`<div class="tablewrap"><table><thead><tr><th>التاريخ</th><th>الحركة</th><th>القيمة</th><th>الرصيد بعدها</th></tr></thead><tbody id="stmtBody"></tbody></table></div>`}
   </div></div>`;
   if(rows.length){
@@ -772,7 +776,7 @@ function pdfWatermarkDataUri(){
   </svg>`;
   return 'data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
 }
-function pdfPageShell(bodyHtml,pageNum,totalPages){
+function pdfPageShell(bodyHtml,pageNum,totalPages,reportTitle){
   const c=PDF_THEME;
   return `
   <div style="width:794px;height:1123px;display:flex;flex-direction:column;background-color:${c.card};background-image:url('${pdfWatermarkDataUri()}');background-repeat:no-repeat;background-position:center center;background-size:794px 1123px;color:${c.ink};direction:rtl;font-family:'Cairo',sans-serif;box-sizing:border-box;padding:54px 50px 46px;">
@@ -785,7 +789,7 @@ function pdfPageShell(bodyHtml,pageNum,totalPages){
         </div>
       </div>
       <div style="text-align:left;">
-        <div style="font-size:13px;font-weight:700;color:${c.ink};">تقرير نسخة احتياطية</div>
+        <div style="font-size:13px;font-weight:700;color:${c.ink};">${reportTitle||'تقرير نسخة احتياطية'}</div>
         <div style="font-size:11px;color:${c.muted};">${today()}</div>
       </div>
     </div>
@@ -796,7 +800,7 @@ function pdfPageShell(bodyHtml,pageNum,totalPages){
     </div>
   </div>`;
 }
-function pdfSectionTitle(text){ return `<div style="font-size:15px;font-weight:800;color:${PDF_THEME.tealD};margin-bottom:14px;">${text}</div>`; }
+function pdfSectionTitle(text){ const t=String(text).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); return `<div style="font-size:15px;font-weight:800;color:${PDF_THEME.tealD};margin-bottom:14px;">${t}</div>`; }
 function pdfTable(headers,rows){
   const c=PDF_THEME;
   const th=`padding:7px 6px;text-align:right;font-size:11px;color:#fff;background:${c.teal};font-weight:700;`;
@@ -813,18 +817,13 @@ function pdfStat(label,val,color){
     <div style="font-size:18px;font-weight:800;color:${color||c.ink};">${fmt(val)}</div>
   </div>`;
 }
-let backupBusy=false;
-async function backupPDF(){
-  if(backupBusy) return;
-  const btn=document.getElementById('backupBtn'); const btnLabel=btn?btn.textContent:'';
-  if(!window.jspdf||!window.html2canvas){ alert('تعذر تحميل مكتبات التصدير، تأكد من اتصالك بالإنترنت وحاول تاني.'); return; }
-  backupBusy=true; if(btn){ btn.disabled=true; btn.textContent='جاري التحضير...'; }
-  const {jsPDF}=window.jspdf;
-  const c=PDF_THEME;
-  const t=totals();
-  const ROWS_PER_PAGE=22;
-  const bodies=[];
-  bodies.push(`
+// ---------- PDF export engine (full backup report, per-tab reports, per-party statements) ----------
+// Every report is a list of "page bodies" (HTML strings); renderPdf() turns each into one A4 page.
+const ROWS_PER_PAGE=22;
+const roleName=r=>r==='both'?'عميل ومورد':(r==='supplier'?'مورد':'عميل');
+function pdfSummaryBody(){
+  const c=PDF_THEME, t=totals();
+  return `
     ${pdfSectionTitle('ملخص عام')}
     <div style="display:flex;gap:10px;margin-bottom:10px;">
       ${pdfStat('إجمالي المشتريات',t.totalPurchases)}
@@ -852,55 +851,68 @@ async function backupPDF(){
       عدد المرتجعات: ${state.returns.length}<br>
       عدد الدفعات المسجلة: ${state.payments.length}<br>
       عدد بنود المصروفات: ${state.expenses.length}
-    </div>`);
-  function chunkRows(title,rows,headers,mapFn){
-    if(!rows.length){ bodies.push(`${pdfSectionTitle(title)}<div style="text-align:center;color:${c.muted};padding:30px 0;font-size:12px;">لا توجد بيانات</div>`); return; }
-    for(let i=0;i<rows.length;i+=ROWS_PER_PAGE){
-      const slice=rows.slice(i,i+ROWS_PER_PAGE);
-      bodies.push(`${pdfSectionTitle(`${title} (${i+1}–${Math.min(i+ROWS_PER_PAGE,rows.length)} من ${rows.length})`)}${pdfTable(headers,slice.map(mapFn))}`);
-    }
+    </div>`;
+}
+// each definition is computed only when that report is requested
+const PDF_DEFS={
+  ledger:()=>({title:'العملاء والموردين (الأرصدة)',rows:allParties(),
+    headers:['الاسم','النوع','الرصيد','الحالة'],
+    map:p=>[p.name,roleName(p.role),fmt(Math.abs(p.balance)),p.balance>0?'ليك عليه':(p.balance<0?'عليك له':'متزن')]}),
+  stock:()=>{ const st=stockWithValue(); const tot=st.reduce((a,i)=>a+i.value,0);
+    return {title:'البضاعة المتبقية',rows:st.concat([{name:'الإجمالي',remainingQty:'',avg:null,value:tot}]),
+      headers:['الصنف','الكمية المتبقية','متوسط سعر الشراء','قيمة المتبقي'],
+      map:i=>[i.name,i.remainingQty,i.avg==null?'':fmt(i.avg),fmt(i.value)]}; },
+  sold:()=>({title:'الكميات المباعة لكل صنف',rows:salesByItem(),
+    headers:['الصنف','الكمية المباعة','المرتجع','متوسط سعر البيع','إجمالي البيع','الربح'],
+    map:r=>[r.name,r.netQty,r.retQty||0,fmt(r.avgPrice),fmt(r.netTotal),fmt(r.profit)]}),
+  buy:()=>({title:'المشتريات',rows:allBuyLines().slice().reverse(),
+    headers:['التاريخ','الصنف','الكمية','سعر الشراء','الإجمالي','المورد'],
+    map:p=>[p.date,p.name,p.qty,fmt(p.price),fmt(p.total),p.supplier]}),
+  sell:()=>({title:'المبيعات',rows:allSellLines().slice().reverse(),
+    headers:['التاريخ','الصنف','الكمية','سعر البيع','الإجمالي','الربح','العميل'],
+    map:s=>[s.date,s.name,s.qty,fmt(s.price),fmt(s.total),fmt(s.profit),s.customer]}),
+  returns:()=>({title:'المرتجعات',rows:state.returns.slice().reverse(),
+    headers:['التاريخ','النوع','الصنف','الكمية','السعر','الإجمالي','الطرف','ملاحظة'],
+    map:r=>[r.date,r.type==='sale'?'بيع':'شراء',r.item,r.qty,fmt(r.price),fmt(r.total),r.party,r.note||'']}),
+  payments:()=>({title:'الدفعات',rows:state.payments.slice().reverse(),
+    headers:['التاريخ','النوع','القيمة','الطرف','ملاحظة'],
+    map:p=>[p.date,p.direction==='in'?'وارد':'صادر',fmt(p.amount),p.party,p.note||'']}),
+  expenses:()=>({title:'المصروفات',rows:state.expenses.slice().reverse(),
+    headers:['التاريخ','البند','القيمة','ملاحظة'],
+    map:x=>[x.date,x.category,fmt(x.amount),x.note||'']}),
+  statements:()=>{ const rows=[];
+    allParties().forEach(p=>{ let run=0; partyRows(p.name,p.role).forEach(r=>{ run+=r.amount; rows.push([p.name,r.date,r.label,fmt(r.amount),fmt(run)]); }); });
+    return {title:'كشوف حساب العملاء والموردين',rows,headers:['الطرف','التاريخ','الحركة','القيمة','الرصيد بعدها'],map:r=>r}; }
+};
+function pdfChunk(bodies,title,rows,headers,mapFn){
+  if(!rows.length){ bodies.push(`${pdfSectionTitle(title)}<div style="text-align:center;color:${PDF_THEME.muted};padding:30px 0;font-size:12px;">لا توجد بيانات</div>`); return; }
+  for(let i=0;i<rows.length;i+=ROWS_PER_PAGE){
+    const slice=rows.slice(i,i+ROWS_PER_PAGE);
+    bodies.push(`${pdfSectionTitle(`${title} (${i+1}–${Math.min(i+ROWS_PER_PAGE,rows.length)} من ${rows.length})`)}${pdfTable(headers,slice.map(mapFn))}`);
   }
-  const roleName=r=>r==='both'?'عميل ومورد':(r==='supplier'?'مورد':'عميل');
-  const parties=allParties();
-  chunkRows('العملاء والموردين (الأرصدة)', parties,
-    ['الاسم','النوع','الرصيد','الحالة'],
-    p=>[p.name,roleName(p.role),fmt(Math.abs(p.balance)),p.balance>0?'ليك عليه':(p.balance<0?'عليك له':'متزن')]);
-  const stock=stockWithValue();
-  const stockTotal=stock.reduce((a,i)=>a+i.value,0);
-  chunkRows('البضاعة المتبقية', stock.concat([{name:'الإجمالي',remainingQty:'',avg:null,value:stockTotal}]),
-    ['الصنف','الكمية المتبقية','متوسط سعر الشراء','قيمة المتبقي'],
-    i=>[i.name,i.remainingQty,i.avg==null?'':fmt(i.avg),fmt(i.value)]);
-  const sold=salesByItem();
-  chunkRows('الكميات المباعة لكل صنف', sold,
-    ['الصنف','الكمية المباعة','المرتجع','متوسط سعر البيع','إجمالي البيع','الربح'],
-    r=>[r.name,r.netQty,r.retQty||0,fmt(r.avgPrice),fmt(r.netTotal),fmt(r.profit)]);
-  chunkRows('المشتريات', allBuyLines().slice().reverse(),
-    ['التاريخ','الصنف','الكمية','سعر الشراء','الإجمالي','المورد'],
-    p=>[p.date,p.name,p.qty,fmt(p.price),fmt(p.total),p.supplier]);
-  chunkRows('المبيعات', allSellLines().slice().reverse(),
-    ['التاريخ','الصنف','الكمية','سعر البيع','الإجمالي','الربح','العميل'],
-    s=>[s.date,s.name,s.qty,fmt(s.price),fmt(s.total),fmt(s.profit),s.customer]);
-  chunkRows('المرتجعات', state.returns.slice().reverse(),
-    ['التاريخ','النوع','الصنف','الكمية','السعر','الإجمالي','الطرف'],
-    r=>[r.date,r.type==='sale'?'بيع':'شراء',r.item,r.qty,fmt(r.price),fmt(r.total),r.party]);
-  chunkRows('الدفعات', state.payments.slice().reverse(),
-    ['التاريخ','النوع','القيمة','الطرف','ملاحظة'],
-    p=>[p.date,p.direction==='in'?'وارد':'صادر',fmt(p.amount),p.party,p.note||'']);
-  chunkRows('المصروفات', state.expenses.slice().reverse(),
-    ['التاريخ','البند','القيمة','ملاحظة'],
-    x=>[x.date,x.category,fmt(x.amount),x.note||'']);
-  const stmtRows=[];
-  parties.forEach(p=>{ let run=0; partyRows(p.name,p.role).forEach(r=>{ run+=r.amount; stmtRows.push([p.name,r.date,r.label,fmt(r.amount),fmt(run)]); }); });
-  chunkRows('كشوف حساب العملاء والموردين', stmtRows,
-    ['الطرف','التاريخ','الحركة','القيمة','الرصيد بعدها'], r=>r);
-  if(document.fonts&&document.fonts.ready){ try{ await document.fonts.ready; }catch(e){} }
+}
+function pdfBodiesFor(keys,withSummary){
+  const bodies=[]; if(withSummary) bodies.push(pdfSummaryBody());
+  keys.forEach(k=>{ const d=PDF_DEFS[k](); pdfChunk(bodies,d.title,d.rows,d.headers,d.map); });
+  return bodies;
+}
+let backupBusy=false;
+// Turns page bodies into a PDF and downloads it. `btn` (optional) shows progress.
+async function renderPdf(makeBodies,filename,reportTitle,btn){
+  if(backupBusy) return;
+  if(!window.jspdf||!window.html2canvas){ alert('تعذر تحميل مكتبات التصدير، تأكد من اتصالك بالإنترنت وحاول تاني.'); return; }
+  const btnLabel=btn?btn.textContent:'';
+  backupBusy=true; if(btn){ btn.disabled=true; btn.textContent='جاري التحضير...'; }
   try{
+    const {jsPDF}=window.jspdf;
+    const bodies=makeBodies();
+    if(document.fonts&&document.fonts.ready){ try{ await document.fonts.ready; }catch(e){} }
     const doc=new jsPDF({orientation:'p',unit:'pt',format:'a4',compress:true});
     const total=bodies.length;
     for(let i=0;i<total;i++){
       const holder=document.createElement('div');
       holder.style.cssText='position:absolute;left:-10000px;top:0;width:794px;height:1123px;';
-      holder.innerHTML=pdfPageShell(bodies[i],i+1,total);
+      holder.innerHTML=pdfPageShell(bodies[i],i+1,total,reportTitle);
       document.body.appendChild(holder);
       let canvas;
       try{ canvas=await html2canvas(holder.firstElementChild,{scale:1.5,backgroundColor:'#ffffff',useCORS:true,logging:false}); }
@@ -913,12 +925,93 @@ async function backupPDF(){
       if(btn) btn.textContent='جاري التصدير... '+(i+1)+' / '+total;
       await new Promise(r=>setTimeout(r,0)); // let the browser breathe / repaint the progress
     }
-    const blob=doc.output('blob');
-    const filename='shop-backup-'+today()+'.pdf';
-    const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(()=>URL.revokeObjectURL(url),30000); // revoking immediately can cancel the download on some browsers
+    downloadBlob(doc.output('blob'),filename);
   }catch(err){ alert('حصل خطأ أثناء إنشاء ملف الـ PDF، جرب تاني. (تفاصيل: '+(err&&err.message?err.message:err)+')'); }
   finally{ backupBusy=false; if(btn){ btn.disabled=false; btn.textContent=btnLabel; } }
+}
+function downloadBlob(blob,filename){
+  const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),30000); // revoking immediately can cancel the download on some browsers
+}
+// full report: summary + everything
+function backupPDF(){
+  renderPdf(()=>pdfBodiesFor(['ledger','stock','sold','buy','sell','returns','payments','expenses','statements'],true),
+    'shop-backup-'+today()+'.pdf','تقرير نسخة احتياطية',document.getElementById('backupBtn'));
+}
+// one report per screen: the button at the top of each tab
+const TAB_REPORTS={
+  dash:{name:'لوحة التحكم',keys:[],summary:true},
+  buy:{name:'المشتريات',keys:['buy']},
+  sell:{name:'المبيعات والمخزون',keys:['stock','sold','sell']},
+  returns:{name:'المرتجعات',keys:['returns']},
+  ledger:{name:'العملاء والموردين',keys:['ledger','statements']},
+  payments:{name:'الدفعات',keys:['payments']},
+  expenses:{name:'المصروفات',keys:['expenses']}
+};
+function exportTabPDF(){
+  const r=TAB_REPORTS[tab]; if(!r) return;
+  renderPdf(()=>pdfBodiesFor(r.keys,!!r.summary),'qayati-'+tab+'-'+today()+'.pdf','تقرير: '+r.name,document.getElementById('tabPdfBtn'));
+}
+// one customer/supplier statement
+function exportPartyPDF(name,role){
+  const rows=partyRows(name,role); let run=0;
+  const data=rows.map(r=>{ run+=r.amount; return [r.date,r.label,fmt(r.amount),fmt(run)]; });
+  const c=PDF_THEME;
+  renderPdf(()=>{
+    const bodies=[];
+    const head=`<div style="font-size:12px;color:${c.muted};margin-bottom:12px;">الرصيد الحالي: <b style="color:${c.ink};">${fmt(Math.abs(run))}</b> ${run>0?'(ليك عليه)':(run<0?'(عليك له)':'(متزن)')}</div>`;
+    pdfChunk(bodies,`كشف حساب (${roleName(role)}): ${name}`,data,['التاريخ','الحركة','القيمة','الرصيد بعدها'],r=>r);
+    bodies[0]=bodies[0].replace('</div>','</div>'+head); // put the balance line right under the title
+    return bodies;
+  },'qayati-statement-'+today()+'.pdf','كشف حساب',document.getElementById('stmtPdfBtn'));
+}
+
+// ---------- restorable backup (JSON) ----------
+// The PDF is for reading/printing; this file is the real safety net: it holds every record
+// (including users and their passwords — keep it private) and can be loaded back with restoreBackupFile().
+function lastBackupInfo(){
+  const iso=(state.meta||{}).lastBackup; if(!iso) return null;
+  const d=new Date(iso); if(isNaN(d)) return null;
+  return {date:d,days:Math.floor((Date.now()-d.getTime())/86400000)};
+}
+function downloadJSONBackup(markAsBackup){
+  if(!isAdmin()) return;
+  const payload={app:'qayati-shop',version:1,exportedAt:new Date().toISOString(),data:state};
+  downloadBlob(new Blob([JSON.stringify(payload)],{type:'application/json'}),'qayati-backup-'+today()+'.json');
+  if(markAsBackup!==false){ state.meta=state.meta||{}; state.meta.lastBackup=new Date().toISOString(); save(); }
+}
+function restoreBackupFile(input){
+  if(!isAdmin()) return;
+  const f=input.files&&input.files[0]; if(!f) return;
+  const reader=new FileReader();
+  reader.onerror=()=>{ alert('تعذر قراءة الملف.'); input.value=''; };
+  reader.onload=async()=>{
+    let n;
+    try{
+      const obj=JSON.parse(reader.result);
+      const data=obj&&obj.app==='qayati-shop'?obj.data:null;
+      if(!data||!Array.isArray(data.users)||!Array.isArray(data.purchaseInvoices)||!Array.isArray(data.saleInvoices)) throw new Error('bad');
+      n=normalizeState(data);
+      if(!n.users.some(u=>u.role==='admin')) throw new Error('no admin');
+    }catch(e){ alert('الملف ده مش نسخة احتياطية صالحة لدفتر القياتي.'); input.value=''; return; }
+    const when=(()=>{ try{ return JSON.parse(reader.result).exportedAt.slice(0,10); }catch(e){ return '؟'; } })();
+    if(!confirm(`النسخة دي بتاريخ ${when} وفيها: ${n.purchaseInvoices.length} فاتورة شراء، ${n.saleInvoices.length} فاتورة بيع، ${n.payments.length} دفعة، ${n.expenses.length} مصروف، ${n.users.length} مستخدم.\n\nهيتم استبدال كل بيانات المحل الحالية بيها. هننزّل نسخة من البيانات الحالية الأول للأمان. متأكد؟`)){ input.value=''; return; }
+    downloadJSONBackup(false); // safety copy of what's there right now
+    clearTimeout(_pushTimer);
+    state=n; _cache=null;
+    try{ localStorage.setItem('shop_state',JSON.stringify(state)); }catch(e){}
+    try{ if(sbConfigured()) await cloudPushState(); alert('تم استرجاع النسخة الاحتياطية ✅ — هتدخل تاني بكلمة مرورك.'); }
+    catch(e){ alert('اتسترجعت البيانات على الجهاز ده، لكن حصل خطأ في رفعها للسحابة — تأكد من الإنترنت وجرب تاني.'); }
+    location.reload();
+  };
+  reader.readAsText(f);
+}
+function backupReminderHtml(){
+  if(!isAdmin()) return '';
+  const info=lastBackupInfo();
+  if(info&&info.days<7) return '';
+  const msg=info?`آخر نسخة احتياطية من ${info.days} يوم.`:'لسه ماعملتش نسخة احتياطية قابلة للاسترجاع.';
+  return `<div class="card" style="border-color:var(--amber);"><b style="color:var(--amber);">⚠️ ${msg}</b> <span class="small">خد نسخة دلوقتي عشان بياناتك تفضل في أمان.</span> <button class="btn sm" style="margin-right:8px;" onclick="downloadJSONBackup()">⬇️ تنزيل نسخة احتياطية</button></div>`;
 }
 
 // ---------- render ----------
@@ -943,6 +1036,7 @@ function render(){
   else if(tab==='expenses') c.innerHTML=renderExpenses();
   else if(tab==='users'&&isAdmin()) c.innerHTML=renderUsers();
   else if(tab==='backup') c.innerHTML=renderBackup();
+  if(TAB_REPORTS[tab]) c.insertAdjacentHTML('afterbegin',`<div style="text-align:left;margin-bottom:10px;"><button class="btn ghost sm" id="tabPdfBtn" onclick="exportTabPDF()">🖨️ طباعة / تنزيل PDF للصفحة دي</button></div>`);
   attachForms();
 }
 function setTab(k){ tab=k; draftBuy=[]; draftSell=[]; pageSize={buy:50,sell:50,payments:50,returns:50,expenses:50}; render(); }
@@ -957,7 +1051,7 @@ function attachForms(){
 function renderDash(){
   const t=totals();
   const returnsTotal=state.returns.reduce((a,r)=>a+r.total,0);
-  return `<div class="grid">
+  return backupReminderHtml()+`<div class="grid">
     <div class="stat"><span>إجمالي المشتريات</span><b>${fmt(t.totalPurchases)}</b></div>
     <div class="stat"><span>إجمالي المبيعات</span><b>${fmt(t.totalSales)}</b></div>
     <div class="stat"><span>ربح المبيعات</span><b>${fmt(t.salesProfit)}</b></div>
@@ -1192,12 +1286,21 @@ function renderUsers(){
   </div>`;
 }
 function renderBackup(){
-  return `<div class="card"><h2>النسخ الاحتياطي</h2>
+  const lb=lastBackupInfo();
+  return `${isAdmin()?`<div class="card"><h2>نسخة احتياطية قابلة للاسترجاع</h2>
+  <p class="small">دي النسخة الأهم: ملف فيه كل بيانات المحل (بما فيها المستخدمين وكلمات المرور — احفظه في مكان آمن). لو حصل مسح أو عطل ترجّع منه كل حاجة زي ما كانت.</p>
+  <p class="small">${lb?`آخر نسخة: ${lb.date.toLocaleDateString('ar-EG')} (من ${lb.days} يوم)`:'لسه ماعملتش نسخة.'}</p>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;">
+    <button class="btn" onclick="downloadJSONBackup()">⬇️ تنزيل نسخة احتياطية</button>
+    <button class="btn ghost" onclick="document.getElementById('restoreFile').click()">⬆️ استرجاع من نسخة</button>
+    <input type="file" id="restoreFile" accept=".json,application/json" style="display:none" onchange="restoreBackupFile(this)">
+  </div></div>`:''}
+  <div class="card"><h2>تقرير PDF للقراءة والطباعة</h2>
   <p class="small">قبل أي تعديل مهم أو كل شوية، اضغط الزرار ده عشان تاخد نسخة PDF بكل بياناتك.</p>
   <button class="btn secondary" id="backupBtn" onclick="backupPDF()">⬇️ تنزيل نسخة PDF الآن</button>
   </div>
   ${isAdmin()?`<div class="card"><h2>مسح كل البيانات</h2>
-  <p class="small">دي عملية نهائية مفيش رجوع فيها — خد نسخة PDF الأول لو مش متأكد.</p>
+  <p class="small">دي عملية نهائية مفيش رجوع فيها — نزّل نسخة احتياطية (الزرار اللي فوق) الأول لو مش متأكد.</p>
   <button class="btn ghost" style="color:var(--danger);border-color:var(--danger)" onclick="resetAllData()">🗑️ مسح كل البيانات نهائيًا</button>
   </div>`:''}`;
 }
