@@ -797,7 +797,7 @@ function pdfTable(headers,rows){
   const td=`padding:6px 6px;font-size:11px;border-bottom:1px solid ${c.line};color:${c.ink};`;
   return `<table style="width:100%;border-collapse:collapse;">
     <thead><tr>${headers.map(h=>`<th style="${th}">${h}</th>`).join('')}</tr></thead>
-    <tbody>${rows.map(r=>`<tr>${r.map(v=>`<td style="${td}">${v}</td>`).join('')}</tr>`).join('')}</tbody>
+    <tbody>${rows.map(r=>`<tr>${r.map(v=>`<td style="${td}">${String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</td>`).join('')}</tr>`).join('')}</tbody>
   </table>`;
 }
 function pdfStat(label,val,color){
@@ -807,12 +807,16 @@ function pdfStat(label,val,color){
     <div style="font-size:18px;font-weight:800;color:${color||c.ink};">${fmt(val)}</div>
   </div>`;
 }
+let backupBusy=false;
 async function backupPDF(){
+  if(backupBusy) return;
+  const btn=document.getElementById('backupBtn'); const btnLabel=btn?btn.textContent:'';
   if(!window.jspdf||!window.html2canvas){ alert('تعذر تحميل مكتبات التصدير، تأكد من اتصالك بالإنترنت وحاول تاني.'); return; }
+  backupBusy=true; if(btn){ btn.disabled=true; btn.textContent='جاري التحضير...'; }
   const {jsPDF}=window.jspdf;
   const c=PDF_THEME;
   const t=totals();
-  const ROWS_PER_PAGE=16;
+  const ROWS_PER_PAGE=22;
   const bodies=[];
   bodies.push(`
     ${pdfSectionTitle('ملخص عام')}
@@ -867,7 +871,7 @@ async function backupPDF(){
     x=>[x.date,x.category,fmt(x.amount),x.note||'']);
   if(document.fonts&&document.fonts.ready){ try{ await document.fonts.ready; }catch(e){} }
   try{
-    const doc=new jsPDF('p','pt','a4');
+    const doc=new jsPDF({orientation:'p',unit:'pt',format:'a4',compress:true});
     const total=bodies.length;
     for(let i=0;i<total;i++){
       const holder=document.createElement('div');
@@ -875,16 +879,22 @@ async function backupPDF(){
       holder.innerHTML=pdfPageShell(bodies[i],i+1,total);
       document.body.appendChild(holder);
       let canvas;
-      try{ canvas=await html2canvas(holder.firstElementChild,{scale:2,backgroundColor:'#ffffff',useCORS:true,logging:false}); }
+      try{ canvas=await html2canvas(holder.firstElementChild,{scale:1.5,backgroundColor:'#ffffff',useCORS:true,logging:false}); }
       finally{ document.body.removeChild(holder); }
       if(i>0) doc.addPage();
-      doc.addImage(canvas.toDataURL('image/png'),'PNG',0,0,595.28,841.89);
+      // JPEG (not PNG): a full-page PNG is ~10x bigger, and with many pages the PDF's total size
+      // blew past the browser's string-length limit ("Invalid string length") on larger data sets.
+      doc.addImage(canvas.toDataURL('image/jpeg',0.82),'JPEG',0,0,595.28,841.89,undefined,'FAST');
+      canvas.width=0; canvas.height=0; // release the canvas memory right away (matters on phones)
+      if(btn) btn.textContent='جاري التصدير... '+(i+1)+' / '+total;
+      await new Promise(r=>setTimeout(r,0)); // let the browser breathe / repaint the progress
     }
     const blob=doc.output('blob');
     const filename='shop-backup-'+today()+'.pdf';
-    const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; a.click();
-    URL.revokeObjectURL(url);
+    const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download=filename; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),30000); // revoking immediately can cancel the download on some browsers
   }catch(err){ alert('حصل خطأ أثناء إنشاء ملف الـ PDF، جرب تاني. (تفاصيل: '+(err&&err.message?err.message:err)+')'); }
+  finally{ backupBusy=false; if(btn){ btn.disabled=false; btn.textContent=btnLabel; } }
 }
 
 // ---------- render ----------
@@ -1160,7 +1170,7 @@ function renderUsers(){
 function renderBackup(){
   return `<div class="card"><h2>النسخ الاحتياطي</h2>
   <p class="small">قبل أي تعديل مهم أو كل شوية، اضغط الزرار ده عشان تاخد نسخة PDF بكل بياناتك.</p>
-  <button class="btn secondary" onclick="backupPDF()">⬇️ تنزيل نسخة PDF الآن</button>
+  <button class="btn secondary" id="backupBtn" onclick="backupPDF()">⬇️ تنزيل نسخة PDF الآن</button>
   </div>
   ${isAdmin()?`<div class="card"><h2>مسح كل البيانات</h2>
   <p class="small">دي عملية نهائية مفيش رجوع فيها — خد نسخة PDF الأول لو مش متأكد.</p>
